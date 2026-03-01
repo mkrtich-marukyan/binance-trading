@@ -1,0 +1,19 @@
+# Build
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+
+# Conan
+.conan2/
+
+# Logs
+*.log
+*.err
+
+# Output
+output/
+statistics.txt
+
+# System files
+binance-trading.service

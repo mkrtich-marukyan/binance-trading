@@ -1,0 +1,12 @@
+[requires]
+boost/1.84.0
+nlohmann_json/3.11.3
+openssl/3.2.0
+gtest/1.14.0
+
+[generators]
+CMakeDeps
+CMakeToolchain
+
+[layout]
+cmake_layout
