@@ -1,5 +1,6 @@
 #include "BinanceTradingApp.h"
 #include <chrono>
+#include <iostream>
 
 BinanceTradingApp::BinanceTradingApp(const std::vector<std::string>& symbols, unsigned int provideStatisticsTime, const std::string& outFileName)
     : m_provideStatisticsTime(provideStatisticsTime), m_output(outFileName)
@@ -61,8 +62,11 @@ void BinanceTradingApp::exec()
     
     auto checkAndRestartIfNeeded = [](TradingPair& tradingPair) 
     {
-        if(!tradingPair.m_api->isRunning() || !tradingPair.m_stat->isRunning())
+        // some of the working threads were stopped or no message for 10 seconds, then restart the trading pair
+        if(!tradingPair.m_api->isRunning() || !tradingPair.m_stat->isRunning() ||
+            std::chrono::steady_clock::now() - tradingPair.m_api->getLastMessageTime() > std::chrono::seconds(10))
         {
+            std::cerr << "Stopped trading pair for " << tradingPair.m_symbol << ", trying to reconnect." << std::endl;
             tradingPair.m_api->stop();
             tradingPair.m_stat->stop();
             tradingPair.m_stat->start();
@@ -92,6 +96,7 @@ void BinanceTradingApp::exec()
                 m_output.addStatistics(it->m_symbol, st);
             }
             
+            // watchdog check, is trading pair running normal
             checkAndRestartIfNeeded(*it);
         }
         

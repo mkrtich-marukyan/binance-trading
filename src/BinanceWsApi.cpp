@@ -1,18 +1,9 @@
 #include "BinanceWsApi.h"
 #include "Properties.h"
-#include <boost/beast.hpp>
-#include <boost/asio.hpp>
-#include <boost/beast/ssl.hpp>
 #include <iostream>
 
-namespace beast = boost::beast;
-namespace websocket = beast::websocket;
-namespace net = boost::asio;
-namespace ssl = net::ssl;
-using tcp = net::ip::tcp;
-
 BinanceWsApi::BinanceWsApi(ThreadSafeMessageQueue& queue, const std::string& symbol)
-    : m_msgQueue(queue), m_symbol(symbol), m_running(false)
+    : m_msgQueue(queue), m_symbol(symbol), m_running(false), m_lastMessageTime(Clock::now())
 {
     // all symbols for streams should be lowercase
     for (char& c : m_symbol) 
@@ -23,25 +14,64 @@ BinanceWsApi::BinanceWsApi(ThreadSafeMessageQueue& queue, const std::string& sym
 
 BinanceWsApi::~BinanceWsApi()
 {
-    if(isRunning())
+    try
     {
-        stop();
+        if(isRunning())
+        {
+            stop();
+        }
+    }
+    catch(...)
+    {
+        // destructors never throw
     }
 }
 
 void BinanceWsApi::start()
 {
+    if (m_running)
+    {
+        return;
+    }
+    
+    m_ioc = std::make_unique<net::io_context>();
+    m_sslCtx = std::make_unique<ssl::context>(ssl::context::tlsv12_client);
+    m_sslCtx->set_default_verify_paths();
+    m_resolver = std::make_unique<tcp::resolver>(*m_ioc);
+    m_ws = std::make_unique<websocket::stream<beast::ssl_stream<tcp::socket>>>(*m_ioc, *m_sslCtx);
+    m_lastMessageTime = Clock::now();
     m_running = true;
     m_worker = std::thread(&BinanceWsApi::run, this);
 }
 
 void BinanceWsApi::stop()
 {
+    std::lock_guard lock(m_mutex);
+    
     m_running = false;
+    
+    if (m_ws)
+    {
+        m_ws->async_close(websocket::close_code::normal, [](boost::beast::error_code ec)
+        {
+            if (ec)
+            {
+                std::cerr << "WebSocket close error: " << ec.message() << std::endl;
+            }
+        });
+    }
+
+    if (m_ioc) m_ioc->stop(); // stop all async operations
+    
     if (m_worker.joinable())
     {
         m_worker.join();
     }
+
+    m_ws.reset();
+    m_resolver.reset();
+    m_sslCtx.reset();
+    m_ioc.reset();
 }
 
 bool BinanceWsApi::isRunning() const
@@ -49,36 +79,53 @@ bool BinanceWsApi::isRunning() const
     return m_running;
 }
 
+TimePoint BinanceWsApi::getLastMessageTime() const
+{
+    return m_lastMessageTime;
+}
+
 void BinanceWsApi::run()
 {
     try 
     {
-        net::io_context ioc;
-        ssl::context ctx{ssl::context::tlsv12_client};
-        ctx.set_default_verify_paths();
+        // initialize connection
+        auto const results = m_resolver->resolve(Properties::Host, Properties::Port);
+        net::connect(m_ws->next_layer().next_layer(), results);
+        m_ws->next_layer().handshake(ssl::stream_base::client);
+        m_ws->handshake(Properties::Host, "/ws/" + m_symbol + "@trade");
 
-        tcp::resolver resolver{ioc};
-        websocket::stream<beast::ssl_stream<tcp::socket>> ws{ioc, ctx};
+        // start async reading
+        auto buffer = std::make_shared<beast::flat_buffer>();
 
-        auto const results = resolver.resolve(Properties::Host, Properties::Port);
-        net::connect(ws.next_layer().next_layer(), results);
+        std::function<void()> do_read = [this, buffer, &do_read]()
+        {
+            m_ws->async_read(*buffer, [this, buffer, &do_read](boost::beast::error_code ec, std::size_t bytes_transferred)
+            {
+                if (!ec && m_running)
+                {
+                    std::string msg = beast::buffers_to_string(buffer->data());
+                    buffer->consume(buffer->size());
+                    m_msgQueue.push(msg);
+                    m_lastMessageTime = Clock::now();
 
-        ws.next_layer().handshake(ssl::stream_base::client);
-        ws.handshake(Properties::Host, "/ws/" + m_symbol + "@trade");
+                    // schedule next async read
+                    do_read();
+                }
+                else if(ec != boost::asio::error::operation_aborted)
+                {
+                    std::cerr << "WebSocket error: " << ec.message() << std::endl;
+                    m_running = false;
+                }
+            });
+        };
 
-        beast::flat_buffer buffer;
-
-        while (m_running) 
-	{
-            ws.read(buffer);
-            std::string msg = beast::buffers_to_string(buffer.data());
-            buffer.consume(buffer.size());
-	    m_msgQueue.push(msg);
-        }
+        do_read(); // start first async read
+        
+        m_ioc->run();
     }
     catch (std::exception& e) 
     {
         std::cerr << "Api Error: " << e.what() << std::endl;
-	stop();
+        m_running = false;
     }
 }

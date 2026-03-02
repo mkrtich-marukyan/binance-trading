@@ -60,3 +60,6 @@ sudo systemctl restart $SERVICE_NAME
 
 echo "Service $SERVICE_NAME installed and started for user $USER_NAME."
 echo "Statistics output: $STATISTICS_FILE"
+
+# Check service status 
+sudo systemctl status binance-trading
